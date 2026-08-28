@@ -1,0 +1,59 @@
+name: Ubuntu SSH Password with Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ssh-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install OpenSSH
+        run: |
+          sudo apt update
+          sudo apt install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+      - name: Create SSH user with password
+        run: |
+          USER=sshuser
+          # Generate a simple 12-char random password
+          PASSWORD=$(openssl rand -base64 12)
+          echo "Creating user $USER with password $PASSWORD"
+          sudo useradd -m -s /bin/bash $USER
+          echo "$USER:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo $USER
+          # Store in environment to show later
+          echo "SSH_USER=$USER" >> $GITHUB_ENV
+          echo "SSH_PASS=$PASSWORD" >> $GITHUB_ENV
+      - name: Enable SSH password login
+        run: |
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config || true
+          sudo systemctl restart ssh
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ssh-$GITHUB_RUN_ID
+      - name: Get Tailscale IP
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+      - name: Show SSH access info
+        run: |
+          echo ""
+          echo "========== SSH ACCESS =========="
+          echo "IP:       $TAILSCALE_IP"
+          echo "User:     $SSH_USER"
+          echo "Password: $SSH_PASS"
+          echo "Command:  ssh $SSH_USER@$TAILSCALE_IP"
+          echo "================================"
+          echo ""
+      - name: Keep runner alive
+        run: |
+          while true; do
+            sleep 300
+          done
