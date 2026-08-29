@@ -1,3 +1,4 @@
+
 name: Tailscale VPN
 
 on:
@@ -14,11 +15,14 @@ jobs:
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           tags: tag:ci
 
       - name: Check Tailscale
         run: |
+          echo "=== Tailscale status ==="
           tailscale status
+
+          echo
+          echo "=== Tailscale IP ==="
           tailscale ip
