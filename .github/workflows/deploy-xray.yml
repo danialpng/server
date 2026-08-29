@@ -1,5 +1,5 @@
 
-name: Generate VLESS Reality Config
+name: Temporary VLESS Reality
 
 on:
   workflow_dispatch:
@@ -8,41 +8,90 @@ permissions:
   contents: read
 
 jobs:
-  generate:
+  xray:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssl uuid-runtime
 
-      - name: Generate VLESS Reality configuration
+      - name: Connect Runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Install Xray
         shell: bash
         run: |
           set -euo pipefail
 
-          UUID="$(uuidgen)"
+          sudo apt-get update
+          sudo apt-get install -y curl jq openssl
 
-          PRIVATE_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
-          PUBLIC_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+          curl -L \
+            https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
+            -o /tmp/install-xray.sh
+
+          sudo bash /tmp/install-xray.sh install
+
+          xray version
+
+      - name: Generate real Xray credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UUID="$(xray uuid)"
+
+          KEY_OUTPUT="$(xray x25519)"
+
+          PRIVATE_KEY="$(echo "$KEY_OUTPUT" | awk -F': ' '/PrivateKey/ {print $2}')"
+          PUBLIC_KEY="$(echo "$KEY_OUTPUT" | awk -F': ' '/Password/ {print $2}')"
 
           SHORT_ID="$(openssl rand -hex 8)"
 
-          SERVER="127.0.0.1"
-          PORT="443"
-          SNI="www.microsoft.com"
+          echo "UUID=$UUID" >> "$GITHUB_ENV"
+          echo "PRIVATE_KEY=$PRIVATE_KEY" >> "$GITHUB_ENV"
+          echo "PUBLIC_KEY=$PUBLIC_KEY" >> "$GITHUB_ENV"
+          echo "SHORT_ID=$SHORT_ID" >> "$GITHUB_ENV"
 
-          cat > config.json <<EOF
+          echo "Credentials generated successfully."
+
+      - name: Get Tailscale IP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4)"
+
+          if [ -z "$TS_IP" ]; then
+            echo "::error::Could not get Tailscale IPv4"
+            exit 1
+          fi
+
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          echo "Runner Tailscale IP:"
+          echo "$TS_IP"
+
+      - name: Create Xray configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo mkdir -p /usr/local/etc/xray
+
+          sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
           {
             "log": {
               "loglevel": "warning"
             },
+
             "inbounds": [
               {
-                "listen": "127.0.0.1",
-                "port": ${PORT},
+                "listen": "0.0.0.0",
+                "port": 443,
                 "protocol": "vless",
+
                 "settings": {
                   "clients": [
                     {
@@ -52,17 +101,22 @@ jobs:
                   ],
                   "decryption": "none"
                 },
+
                 "streamSettings": {
                   "network": "tcp",
                   "security": "reality",
+
                   "realitySettings": {
                     "show": false,
-                    "dest": "${SNI}:443",
+                    "target": "www.microsoft.com:443",
                     "xver": 0,
+
                     "serverNames": [
-                      "${SNI}"
+                      "www.microsoft.com"
                     ],
+
                     "privateKey": "${PRIVATE_KEY}",
+
                     "shortIds": [
                       "${SHORT_ID}"
                     ]
@@ -70,6 +124,7 @@ jobs:
                 }
               }
             ],
+
             "outbounds": [
               {
                 "protocol": "freedom"
@@ -78,20 +133,91 @@ jobs:
           }
           EOF
 
-          VLESS="vless://${UUID}@${SERVER}:${PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&flow=xtls-rprx-vision#temporary-xray"
+          echo "Testing Xray configuration..."
 
-          printf '%s\n' "$VLESS" > vless.txt
+          sudo xray run \
+            -test \
+            -config /usr/local/etc/xray/config.json
 
-          echo "VLESS configuration generated."
-          echo "Files:"
-          echo "  config.json"
-          echo "  vless.txt"
+      - name: Start temporary Xray
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo nohup xray run \
+            -config /usr/local/etc/xray/config.json \
+            > /tmp/xray.log 2>&1 &
+
+          sleep 3
+
+          if ! pgrep -x xray > /dev/null; then
+            echo "::error::Xray failed to start."
+            cat /tmp/xray.log
+            exit 1
+          fi
+
+          echo "Xray is running."
+
+      - name: Generate VLESS configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VLESS_URL="vless://${UUID}@${TS_IP}:443?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=www.microsoft.com&sid=${SHORT_ID}&flow=xtls-rprx-vision#github-temporary"
+
+          printf '%s\n' "$VLESS_URL" > vless.txt
+
+          sudo cp /usr/local/etc/xray/config.json xray-server.json
+
+          cat > client-info.txt <<EOF
+          Server: ${TS_IP}
+          Port: 443
+          Protocol: VLESS
+          Security: REALITY
+          SNI: www.microsoft.com
+          UUID: ${UUID}
+          PublicKey: ${PUBLIC_KEY}
+          ShortID: ${SHORT_ID}
+          Flow: xtls-rprx-vision
+          EOF
+
+          echo "===== VLESS CONFIG ====="
+          cat vless.txt
+
+      - name: Add configuration to Summary
+        shell: bash
+        run: |
+          {
+            echo "## Temporary VLESS + Reality"
+            echo
+            echo "Runner Tailscale IP:"
+            echo "\`${TS_IP}\`"
+            echo
+            echo '```text'
+            cat vless.txt
+            echo '```'
+            echo
+            echo "⚠️ این کانفیگ فقط تا زمانی معتبر است که همین GitHub Job و Runner فعال باشند."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload configuration
         uses: actions/upload-artifact@v4
         with:
-          name: vless-reality-config
+          name: temporary-vless-reality
           path: |
-            config.json
             vless.txt
+            client-info.txt
+            xray-server.json
           retention-days: 1
+
+      - name: Keep Xray alive
+        shell: bash
+        run: |
+          echo "Xray is running."
+          echo "Tailscale IP: ${TS_IP}"
+          echo "The temporary server will stop when this workflow ends."
+
+          for i in $(seq 1 25); do
+            echo "Running... ${i}/25"
+            sleep 60
+          done
