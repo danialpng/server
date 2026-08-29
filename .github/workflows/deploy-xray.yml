@@ -1,5 +1,5 @@
 
-name: Temporary Tailscale Runner
+name: Generate VLESS Reality Config
 
 on:
   workflow_dispatch:
@@ -8,35 +8,90 @@ permissions:
   contents: read
 
 jobs:
-  tailscale:
+  generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl uuid-runtime
+
+      - name: Generate VLESS Reality configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UUID="$(uuidgen)"
+
+          PRIVATE_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+          PUBLIC_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+
+          SHORT_ID="$(openssl rand -hex 8)"
+
+          SERVER="127.0.0.1"
+          PORT="443"
+          SNI="www.microsoft.com"
+
+          cat > config.json <<EOF
+          {
+            "log": {
+              "loglevel": "warning"
+            },
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": ${PORT},
+                "protocol": "vless",
+                "settings": {
+                  "clients": [
+                    {
+                      "id": "${UUID}",
+                      "flow": "xtls-rprx-vision"
+                    }
+                  ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "show": false,
+                    "dest": "${SNI}:443",
+                    "xver": 0,
+                    "serverNames": [
+                      "${SNI}"
+                    ],
+                    "privateKey": "${PRIVATE_KEY}",
+                    "shortIds": [
+                      "${SHORT_ID}"
+                    ]
+                  }
+                }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "freedom"
+              }
+            ]
+          }
+          EOF
+
+          VLESS="vless://${UUID}@${SERVER}:${PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&flow=xtls-rprx-vision#temporary-xray"
+
+          printf '%s\n' "$VLESS" > vless.txt
+
+          echo "VLESS configuration generated."
+          echo "Files:"
+          echo "  config.json"
+          echo "  vless.txt"
+
+      - name: Upload configuration
+        uses: actions/upload-artifact@v4
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-
-      - name: Show Tailscale information
-        run: |
-          echo "===== Tailscale status ====="
-          tailscale status
-
-          echo
-          echo "===== Tailscale IPv4 ====="
-          tailscale ip -4
-
-          echo
-          echo "===== Runner hostname ====="
-          hostname
-
-      - name: Keep runner alive
-        run: |
-          echo "Runner is connected to Tailscale."
-          echo "The runner will remain available until the job ends."
-
-          for i in $(seq 1 30); do
-            echo "Running... $i/30"
-            sleep 60
-          done
+          name: vless-reality-config
+          path: |
+            config.json
+            vless.txt
+          retention-days: 1
