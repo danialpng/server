@@ -1,4 +1,4 @@
-name: Ubuntu SSH Password with Tailscale
+name: T2HASH Foreign Server + SSH + Tailscale
 
 on:
   workflow_dispatch:
@@ -12,14 +12,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y openssh-server git curl expect
+          sudo apt install -y openssh-server git curl expect openssl
           sudo systemctl enable ssh
           sudo systemctl start ssh
 
-      - name: Create SSH user with password
+      - name: Create SSH user
         run: |
           USER=sshuser
-          PASSWORD=$(openssl rand -base64 12)
+          PASSWORD=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 16)
 
           sudo useradd -m -s /bin/bash "$USER"
           echo "$USER:$PASSWORD" | sudo chpasswd
@@ -43,20 +43,30 @@ jobs:
           cd T2HASH-CORE/t2tunnel
 
           expect <<'EOF'
-          set timeout 120
+          set timeout 300
 
           spawn sudo bash install.sh
 
           expect {
               -re {Choose \[1/2\]:} {
-                  send "1\r"
+                  send "2\r"
                   exp_continue
               }
+
               -re {type 1 or 2} {
-                  send "1\r"
+                  send "2\r"
                   exp_continue
               }
-              eof
+
+              eof {
+                  catch wait result
+                  exit [lindex $result 3]
+              }
+
+              timeout {
+                  puts "ERROR: T2HASH installer timed out."
+                  exit 1
+              }
           }
           EOF
 
@@ -66,27 +76,39 @@ jobs:
 
           sudo tailscale up \
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-            --hostname="gh-ssh-$GITHUB_RUN_ID"
+            --hostname="gh-t2hash-$GITHUB_RUN_ID"
 
       - name: Get Tailscale IP
         run: |
           TS_IP=$(tailscale ip -4)
+
+          if [ -z "$TS_IP" ]; then
+            echo "ERROR: Tailscale IP was not detected."
+            exit 1
+          fi
+
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
 
-      - name: Show SSH access info
+      - name: Show connection information
         run: |
           echo ""
-          echo "========== SSH ACCESS =========="
-          echo "IP:       $TAILSCALE_IP"
-          echo "User:     $SSH_USER"
-          echo "Password: $SSH_PASS"
+          echo "=========================================="
+          echo "       T2HASH FOREIGN SERVER"
+          echo "=========================================="
+          echo "Tailscale IP : $TAILSCALE_IP"
+          echo "SSH User     : $SSH_USER"
+          echo "SSH Password : $SSH_PASS"
           echo ""
           echo "SSH:"
           echo "ssh $SSH_USER@$TAILSCALE_IP"
           echo ""
-          echo "Port Forward:"
-          echo "ssh -L 2331:127.0.0.1:2331 $SSH_USER@$TAILSCALE_IP"
-          echo "================================"
+          echo "T2HASH Panel:"
+          echo "http://$TAILSCALE_IP:2332"
+          echo ""
+          echo "SSH Port Forward:"
+          echo "ssh -L 2332:127.0.0.1:2332 $SSH_USER@$TAILSCALE_IP"
+          echo "=========================================="
+          echo ""
 
       - name: Keep runner alive
         run: |
