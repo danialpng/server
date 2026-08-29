@@ -1,16 +1,18 @@
-name: Deploy Xray VLESS + Reality over Tailscale
+````yaml
+name: Deploy Xray VLESS Reality over Tailscale
 
 on:
   workflow_dispatch:
     inputs:
       regenerate:
-        description: "Generate a new UUID and new Reality keys"
+        description: "Generate new UUID and Reality keys"
         required: true
         type: boolean
         default: false
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: deploy-xray
@@ -20,7 +22,7 @@ jobs:
   deploy:
     name: Deploy Xray
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -32,33 +34,41 @@ jobs:
 
     steps:
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Tailscale
-      # ------------------------------------------------------------
+      # ==========================================================
+      # TAILSCALE
+      # ==========================================================
 
-      - name: Connect GitHub Runner to Tailscale
-        uses: tailscale/github-action@v3
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          audience: ${{ secrets.TS_AUDIENCE }}
           tags: tag:ci
+          version: latest
+          ping: ${{ secrets.VPS_HOST }}
 
-      - name: Show Tailscale status
+      - name: Verify Tailscale
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
+          echo "=== Tailscale status ==="
           tailscale status
 
           echo
-          echo "Tailscale IPs:"
+          echo "=== Tailscale IP ==="
           tailscale ip
 
-      # ------------------------------------------------------------
+          echo
+          echo "=== Testing VPS ==="
+          tailscale ping "$VPS_HOST"
+
+      # ==========================================================
       # SSH
-      # ------------------------------------------------------------
+      # ==========================================================
 
       - name: Configure SSH
         shell: bash
@@ -68,12 +78,12 @@ jobs:
           set -euo pipefail
 
           if [ -z "${VPS_HOST:-}" ]; then
-            echo "::error::VPS_HOST secret is empty"
+            echo "::error::VPS_HOST is empty"
             exit 1
           fi
 
           if [ -z "${SSH_KEY:-}" ]; then
-            echo "::error::VPS_SSH_KEY secret is empty"
+            echo "::error::VPS_SSH_KEY is empty"
             exit 1
           fi
 
@@ -98,42 +108,46 @@ jobs:
 
           chmod 600 "$HOME/.ssh/config"
 
-      - name: Test SSH connection
+      - name: Test SSH
         shell: bash
         run: |
           set -e
 
-          echo "Testing SSH connection to VPS..."
-
           for i in $(seq 1 30); do
-            if ssh vps 'echo "SSH_OK"; hostname; id -un' 2>/dev/null; then
-              echo "VPS is reachable."
+            if ssh vps 'echo SSH_OK && hostname && id -un'; then
               exit 0
             fi
 
-            echo "Waiting for VPS... ${i}/30"
+            echo "Waiting for SSH... $i/30"
             sleep 5
           done
 
-          echo "::error::Cannot connect to VPS through Tailscale."
-          echo "::error::Check VPS_HOST, Tailscale ACLs, tags and SSH service."
+          echo "::error::SSH connection failed"
           exit 1
 
-      # ------------------------------------------------------------
-      # Deploy
-      # ------------------------------------------------------------
+      # ==========================================================
+      # XRAY
+      # ==========================================================
 
-      - name: Prepare setup script
+      - name: Check setup script
         shell: bash
         run: |
           set -e
 
-          if [ ! -f "scripts/setup-xray.sh" ]; then
-            echo "::error::scripts/setup-xray.sh does not exist"
-            exit 1
-          fi
+          test -f scripts/setup-xray.sh
 
           chmod +x scripts/setup-xray.sh
+
+      - name: Upload setup script
+        shell: bash
+        run: |
+          set -e
+
+          scp scripts/setup-xray.sh vps:/tmp/setup-xray.sh
+
+          ssh vps '
+            chmod 700 /tmp/setup-xray.sh
+          '
 
       - name: Install and configure Xray
         shell: bash
@@ -143,47 +157,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Uploading setup script..."
-
-          scp scripts/setup-xray.sh vps:/tmp/setup-xray.sh
-
           ssh vps \
-            "chmod 700 /tmp/setup-xray.sh && \
-             XRAY_UUID='${XRAY_UUID}' \
+            "XRAY_UUID='${XRAY_UUID}' \
              XRAY_PORT='${XRAY_PORT}' \
              REALITY_DEST='${REALITY_DEST}' \
              NODE_NAME='${NODE_NAME}' \
              REGENERATE='${REGENERATE}' \
              bash /tmp/setup-xray.sh"
 
-      # ------------------------------------------------------------
-      # Verify
-      # ------------------------------------------------------------
+      # ==========================================================
+      # VERIFY XRAY
+      # ==========================================================
 
-      - name: Verify Xray service
+      - name: Verify Xray
         shell: bash
         run: |
           set -e
 
           ssh vps '
             echo "=== Xray service ==="
-            systemctl is-enabled xray || true
+
+            systemctl is-enabled xray
+
             systemctl is-active xray
 
             echo
-            echo "=== Listening ports ==="
+            echo "=== Listening ==="
+
             ss -lntp | grep ":${XRAY_PORT}" || true
 
             echo
-            echo "=== Xray status ==="
-            systemctl --no-pager --full status xray | tail -n 30
+            echo "=== Recent logs ==="
+
+            journalctl -u xray \
+              --no-pager \
+              -n 30
           '
 
-      # ------------------------------------------------------------
-      # Fetch links
-      # ------------------------------------------------------------
+      # ==========================================================
+      # GET CONFIG
+      # ==========================================================
 
-      - name: Fetch generated VLESS links
+      - name: Fetch VLESS links
         shell: bash
         run: |
           set -e
@@ -193,33 +208,33 @@ jobs:
           scp vps:/tmp/vless-link.txt ./vless-link.txt
 
           if [ ! -s ./vless-link.txt ]; then
-            echo "::error::vless-link.txt is empty or missing"
+            echo "::error::vless-link.txt was not generated"
             exit 1
           fi
 
-          echo "VLESS links fetched successfully."
+          echo "VLESS configuration generated successfully."
 
-      # ------------------------------------------------------------
-      # Job Summary
-      # ------------------------------------------------------------
+      # ==========================================================
+      # SUMMARY
+      # ==========================================================
 
-      - name: Write links to Job Summary
+      - name: Write GitHub Summary
         shell: bash
         run: |
           {
-            echo "## VLESS + Reality"
+            echo "## Xray VLESS + Reality"
             echo
             echo '```text'
             cat vless-link.txt
             echo '```'
             echo
-            echo "⚠️ این فایل شامل UUID و اطلاعات اتصال است."
-            echo "آن را در ریپوی عمومی یا کانال عمومی قرار نده."
+            echo "⚠️ این اطلاعات خصوصی هستند."
+            echo "UUID و کلیدهای اتصال را عمومی نکن."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ------------------------------------------------------------
-      # Artifact
-      # ------------------------------------------------------------
+      # ==========================================================
+      # ARTIFACT
+      # ==========================================================
 
       - name: Upload VLESS configuration
         uses: actions/upload-artifact@v4
@@ -228,3 +243,4 @@ jobs:
           path: vless-link.txt
           if-no-files-found: error
           retention-days: 7
+````
