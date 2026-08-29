@@ -12,7 +12,7 @@ jobs:
       - name: Install OpenSSH
         run: |
           sudo apt update
-          sudo apt install -y openssh-server git curl
+          sudo apt install -y openssh-server git curl expect
           sudo systemctl enable ssh
           sudo systemctl start ssh
 
@@ -37,12 +37,42 @@ jobs:
       - name: Install T2HASH
         run: |
           git clone https://github.com/T2HASH/T2HASH-CORE.git
+
           cd T2HASH-CORE/t2tunnel
-          sudo bash install.sh
+
+          expect <<'EOF'
+          spawn sudo bash install.sh
+
+          expect {
+              "Select" {
+                  send "1\r"
+                  exp_continue
+              }
+              "select" {
+                  send "1\r"
+                  exp_continue
+              }
+              "选择" {
+                  send "1\r"
+                  exp_continue
+              }
+              "سرور" {
+                  send "1\r"
+                  exp_continue
+              }
+              timeout {
+                  exit 1
+              }
+              eof
+          }
+          EOF
+
+          printf "2\n" | sudo bash install.sh
 
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
+
           sudo tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --hostname=gh-ssh-$GITHUB_RUN_ID
@@ -59,10 +89,11 @@ jobs:
           echo "IP:       $TAILSCALE_IP"
           echo "User:     $SSH_USER"
           echo "Password: $SSH_PASS"
-          echo "Command:"
+          echo ""
+          echo "SSH:"
           echo "ssh $SSH_USER@$TAILSCALE_IP"
           echo ""
-          echo "For local port forwarding:"
+          echo "Port Forward:"
           echo "ssh -L 2331:127.0.0.1:2331 $SSH_USER@$TAILSCALE_IP"
           echo "================================"
 
