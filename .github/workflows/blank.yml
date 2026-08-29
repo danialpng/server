@@ -1,248 +1,25 @@
-````yaml
-name: Deploy V2Ray Xray over Tailscale
+name: Tailscale VPN
 
 on:
   workflow_dispatch:
-    inputs:
-      regenerate:
-        description: "Generate a new UUID and Reality keys"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: v2ray-deploy
-  cancel-in-progress: false
-
 jobs:
-  deploy:
-    name: Deploy Xray VLESS Reality
+  tailscale:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    env:
-      VPS_HOST: ${{ secrets.VPS_HOST }}
-      VPS_USER: ${{ secrets.VPS_USER || 'root' }}
-      SSH_PORT: ${{ secrets.VPS_SSH_PORT || '22' }}
-      XRAY_PORT: ${{ secrets.XRAY_PORT || '443' }}
-      REALITY_DEST: ${{ secrets.REALITY_DEST || 'www.microsoft.com:443' }}
-      NODE_NAME: ${{ secrets.NODE_NAME || 'xray-reality' }}
 
     steps:
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ==========================================================
-      # TAILSCALE
-      # ==========================================================
-
-      - name: Connect GitHub Runner to Tailscale
+      - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          version: latest
-          ping: ${{ secrets.VPS_HOST }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: tag:ci
 
-      - name: Verify Tailscale
-        shell: bash
+      - name: Check Tailscale
         run: |
-          set -euo pipefail
-
-          echo "===== Tailscale status ====="
           tailscale status
-
-          echo
-          echo "===== Tailscale IP ====="
           tailscale ip
-
-          echo
-          echo "===== Testing VPS ====="
-
-          if [ -z "${VPS_HOST:-}" ]; then
-            echo "::error::VPS_HOST is empty"
-            exit 1
-          fi
-
-          tailscale ping "$VPS_HOST"
-
-      # ==========================================================
-      # SSH
-      # ==========================================================
-
-      - name: Configure SSH
-        shell: bash
-        env:
-          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${SSH_KEY:-}" ]; then
-            echo "::error::VPS_SSH_KEY is empty"
-            exit 1
-          fi
-
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
-
-          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-
-          cat > "$HOME/.ssh/config" <<EOF
-          Host vps
-            HostName ${VPS_HOST}
-            User ${VPS_USER}
-            Port ${SSH_PORT}
-            IdentityFile ${HOME}/.ssh/id_ed25519
-            StrictHostKeyChecking accept-new
-            ConnectTimeout 10
-            ConnectionAttempts 3
-            ServerAliveInterval 15
-            ServerAliveCountMax 3
-          EOF
-
-          chmod 600 "$HOME/.ssh/config"
-
-      - name: Test SSH
-        shell: bash
-        run: |
-          set -e
-
-          echo "Connecting to VPS..."
-
-          for i in $(seq 1 30); do
-
-            if ssh vps 'echo SSH_OK && hostname && id -un'; then
-              echo "SSH connection successful."
-              exit 0
-            fi
-
-            echo "Waiting for VPS... $i/30"
-            sleep 5
-
-          done
-
-          echo "::error::SSH connection to VPS failed."
-          exit 1
-
-      # ==========================================================
-      # XRAY SETUP
-      # ==========================================================
-
-      - name: Check setup script
-        shell: bash
-        run: |
-          set -e
-
-          if [ ! -f "scripts/setup-xray.sh" ]; then
-            echo "::error::scripts/setup-xray.sh does not exist"
-            exit 1
-          fi
-
-          chmod +x scripts/setup-xray.sh
-
-      - name: Upload setup script
-        shell: bash
-        run: |
-          set -e
-
-          scp scripts/setup-xray.sh vps:/tmp/setup-xray.sh
-
-          ssh vps '
-            chmod 700 /tmp/setup-xray.sh
-          '
-
-      - name: Install and configure Xray
-        shell: bash
-        env:
-          XRAY_UUID: ${{ secrets.XRAY_UUID }}
-          REGENERATE: ${{ inputs.regenerate && '1' || '0' }}
-        run: |
-          set -euo pipefail
-
-          ssh vps \
-            "XRAY_UUID='${XRAY_UUID}' \
-             XRAY_PORT='${XRAY_PORT}' \
-             REALITY_DEST='${REALITY_DEST}' \
-             NODE_NAME='${NODE_NAME}' \
-             REGENERATE='${REGENERATE}' \
-             bash /tmp/setup-xray.sh"
-
-      # ==========================================================
-      # VERIFY XRAY
-      # ==========================================================
-
-      - name: Verify Xray
-        shell: bash
-        run: |
-          set -e
-
-          ssh vps '
-            echo "===== Xray service ====="
-
-            systemctl is-enabled xray
-            systemctl is-active xray
-
-            echo
-            echo "===== Xray status ====="
-
-            systemctl --no-pager --full status xray | tail -n 40
-
-            echo
-            echo "===== Listening ports ====="
-
-            ss -lntp | grep ":443" || true
-          '
-
-      # ==========================================================
-      # GET VLESS CONFIG
-      # ==========================================================
-
-      - name: Fetch VLESS configuration
-        shell: bash
-        run: |
-          set -e
-
-          rm -f vless-link.txt
-
-          scp vps:/tmp/vless-link.txt ./vless-link.txt
-
-          if [ ! -s "./vless-link.txt" ]; then
-            echo "::error::VLESS configuration was not generated."
-            exit 1
-          fi
-
-          echo "VLESS configuration generated."
-
-      # ==========================================================
-      # GITHUB SUMMARY
-      # ==========================================================
-
-      - name: Show VLESS configuration
-        shell: bash
-        run: |
-          {
-            echo "## VLESS + Reality"
-            echo
-            echo '```text'
-            cat vless-link.txt
-            echo '```'
-            echo
-            echo "⚠️ این لینک‌ها خصوصی هستند."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # ==========================================================
-      # ARTIFACT
-      # ==========================================================
-
-      - name: Upload VLESS configuration
-        uses: actions/upload-artifact@v4
-        with:
-          name: vless-link
-          path: vless-link.txt
-          if-no-files-found: error
-          retention-days: 7
-````
+```
