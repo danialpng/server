@@ -1,0 +1,42 @@
+
+name: Temporary Tailscale Runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tailscale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Show Tailscale information
+        run: |
+          echo "===== Tailscale status ====="
+          tailscale status
+
+          echo
+          echo "===== Tailscale IPv4 ====="
+          tailscale ip -4
+
+          echo
+          echo "===== Runner hostname ====="
+          hostname
+
+      - name: Keep runner alive
+        run: |
+          echo "Runner is connected to Tailscale."
+          echo "The runner will remain available until the job ends."
+
+          for i in $(seq 1 30); do
+            echo "Running... $i/30"
+            sleep 60
+          done
