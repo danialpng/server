@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install OpenSSH
+      - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y openssh-server git curl expect
@@ -21,66 +21,57 @@ jobs:
           USER=sshuser
           PASSWORD=$(openssl rand -base64 12)
 
-          sudo useradd -m -s /bin/bash $USER
+          sudo useradd -m -s /bin/bash "$USER"
           echo "$USER:$PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo $USER
+          sudo usermod -aG sudo "$USER"
 
-          echo "SSH_USER=$USER" >> $GITHUB_ENV
-          echo "SSH_PASS=$PASSWORD" >> $GITHUB_ENV
+          echo "SSH_USER=$USER" >> "$GITHUB_ENV"
+          echo "SSH_PASS=$PASSWORD" >> "$GITHUB_ENV"
 
       - name: Enable SSH password login
         run: |
-          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i \
+            -e 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' \
+            -e 's/^PasswordAuthentication no/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
           sudo systemctl restart ssh
 
       - name: Install T2HASH
         run: |
           git clone https://github.com/T2HASH/T2HASH-CORE.git
-
           cd T2HASH-CORE/t2tunnel
 
           expect <<'EOF'
+          set timeout 120
+
           spawn sudo bash install.sh
 
           expect {
-              "Select" {
+              -re {Choose \[1/2\]:} {
                   send "1\r"
                   exp_continue
               }
-              "select" {
+              -re {type 1 or 2} {
                   send "1\r"
                   exp_continue
-              }
-              "选择" {
-                  send "1\r"
-                  exp_continue
-              }
-              "سرور" {
-                  send "1\r"
-                  exp_continue
-              }
-              timeout {
-                  exit 1
               }
               eof
           }
           EOF
-
-          printf "2\n" | sudo bash install.sh
 
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
           sudo tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=gh-ssh-$GITHUB_RUN_ID
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="gh-ssh-$GITHUB_RUN_ID"
 
       - name: Get Tailscale IP
         run: |
           TS_IP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
 
       - name: Show SSH access info
         run: |
