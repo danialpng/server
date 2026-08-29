@@ -1,5 +1,5 @@
 ````yaml
-name: Deploy Xray VLESS Reality over Tailscale
+name: Deploy Xray VLESS Reality
 
 on:
   workflow_dispatch:
@@ -49,8 +49,9 @@ jobs:
           tags: tag:ci
           version: latest
           ping: ${{ secrets.VPS_HOST }}
+          log-mode: normal
 
-      - name: Verify Tailscale
+      - name: Check Tailscale
         shell: bash
         run: |
           set -euo pipefail
@@ -63,8 +64,13 @@ jobs:
           tailscale ip
 
           echo
-          echo "=== Testing VPS ==="
-          tailscale ping "$VPS_HOST"
+          echo "=== VPS ==="
+          echo "$VPS_HOST"
+
+          if [ -z "${VPS_HOST:-}" ]; then
+            echo "::error::VPS_HOST is empty"
+            exit 1
+          fi
 
       # ==========================================================
       # SSH
@@ -78,12 +84,12 @@ jobs:
           set -euo pipefail
 
           if [ -z "${VPS_HOST:-}" ]; then
-            echo "::error::VPS_HOST is empty"
+            echo "::error::VPS_HOST secret is empty"
             exit 1
           fi
 
           if [ -z "${SSH_KEY:-}" ]; then
-            echo "::error::VPS_SSH_KEY is empty"
+            echo "::error::VPS_SSH_KEY secret is empty"
             exit 1
           fi
 
@@ -113,32 +119,38 @@ jobs:
         run: |
           set -e
 
+          echo "Testing SSH connection..."
+
           for i in $(seq 1 30); do
             if ssh vps 'echo SSH_OK && hostname && id -un'; then
+              echo "SSH connection successful."
               exit 0
             fi
 
-            echo "Waiting for SSH... $i/30"
+            echo "Waiting for VPS... $i/30"
             sleep 5
           done
 
-          echo "::error::SSH connection failed"
+          echo "::error::Could not connect to VPS through Tailscale."
           exit 1
 
       # ==========================================================
-      # XRAY
+      # XRAY SETUP
       # ==========================================================
 
-      - name: Check setup script
+      - name: Check Xray setup script
         shell: bash
         run: |
           set -e
 
-          test -f scripts/setup-xray.sh
+          if [ ! -f "scripts/setup-xray.sh" ]; then
+            echo "::error::scripts/setup-xray.sh not found"
+            exit 1
+          fi
 
           chmod +x scripts/setup-xray.sh
 
-      - name: Upload setup script
+      - name: Upload Xray setup script
         shell: bash
         run: |
           set -e
@@ -178,24 +190,21 @@ jobs:
             echo "=== Xray service ==="
 
             systemctl is-enabled xray
-
             systemctl is-active xray
 
             echo
-            echo "=== Listening ==="
+            echo "=== Xray status ==="
 
-            ss -lntp | grep ":${XRAY_PORT}" || true
+            systemctl --no-pager --full status xray | tail -n 30
 
             echo
-            echo "=== Recent logs ==="
+            echo "=== Listening port ==="
 
-            journalctl -u xray \
-              --no-pager \
-              -n 30
+            ss -lntp | grep ":443" || true
           '
 
       # ==========================================================
-      # GET CONFIG
+      # GET VLESS CONFIG
       # ==========================================================
 
       - name: Fetch VLESS links
@@ -207,18 +216,18 @@ jobs:
 
           scp vps:/tmp/vless-link.txt ./vless-link.txt
 
-          if [ ! -s ./vless-link.txt ]; then
-            echo "::error::vless-link.txt was not generated"
+          if [ ! -s "./vless-link.txt" ]; then
+            echo "::error::vless-link.txt is missing or empty"
             exit 1
           fi
 
-          echo "VLESS configuration generated successfully."
+          echo "VLESS links generated successfully."
 
       # ==========================================================
-      # SUMMARY
+      # GITHUB SUMMARY
       # ==========================================================
 
-      - name: Write GitHub Summary
+      - name: Write configuration to Job Summary
         shell: bash
         run: |
           {
@@ -229,7 +238,7 @@ jobs:
             echo '```'
             echo
             echo "⚠️ این اطلاعات خصوصی هستند."
-            echo "UUID و کلیدهای اتصال را عمومی نکن."
+            echo "UUID و لینک‌های VLESS را عمومی نکن."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ==========================================================
