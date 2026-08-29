@@ -1,0 +1,182 @@
+name: 3x-ui (Sanaei) + WireGuard + Tailscale
+
+# روی رانر گیت‌هاب نصب می‌شود:
+#   1) Tailscale — رانر با TAILSCALE_AUTHKEY وارد شبکهٔ شما می‌شود (آی‌پی 100.x پایدار برای پنل)
+#   2) WireGuard — سرور WG مستقل با کانفیگ کلاینت در Artifacts
+#   3) پنل 3x-ui سنایی — مدیریت Xray + ساخت این‌باند VLESS+Reality از طریق API پنل
+# خروجی: لینک‌های vless:// (IP عمومی + IP تیل‌اسکیل)، کانفیگ WireGuard، و آدرس/رمز پنل در Summary
+# عمر رانر ~۶ ساعت است.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: 3xui-runner
+  cancel-in-progress: true
+
+timeout-minutes: 350
+
+permissions:
+  contents: read
+
+env:
+  VLESS_PORT: "443"
+  WG_PORT: "51820"
+  REALITY_SNI: "www.microsoft.com"
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate secrets
+        run: |
+          echo "PANEL_USER=admin" >> "$GITHUB_ENV"
+          PANEL_PASS="$(openssl rand -hex 8)"
+          PANEL_PORT="$(shuf -i 20000-30000 -n1)"
+          UUID="$(cat /proc/sys/kernel/random/uuid)"
+          echo "PANEL_PASS=$PANEL_PASS" >> "$GITHUB_ENV"
+          echo "PANEL_PORT=$PANEL_PORT" >> "$GITHUB_ENV"
+          echo "UUID=$UUID" >> "$GITHUB_ENV"
+          mkdir -p out
+
+      - name: Preflight — TAILSCALE_AUTHKEY
+        env:
+          AK: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          [ -n "$AK" ] || { echo "::error title=Missing secret::TAILSCALE_AUTHKEY در Settings -> Secrets تعریف نشده"; exit 1; }
+
+      # ---------- 1) Tailscale ----------
+      - name: Install & connect Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="gh-3xui-${{ github.run_id }}" --accept-dns=false --operator="$USER"
+          TS_IP="$(tailscale ip -4 | head -n1)"
+          [ -n "$TS_IP" ] || { echo "::error::tailscale IP not assigned"; exit 1; }
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "tailscale: $TS_IP"
+
+      # ---------- 2) WireGuard ----------
+      - name: Install & start WireGuard server
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools
+          SRV_PRIV="$(wg genkey)"; SRV_PUB="$(echo "$SRV_PRIV" | wg pubkey)"
+          CLI_PRIV="$(wg genkey)"; CLI_PUB="$(echo "$CLI_PRIV" | wg pubkey)"
+          sudo tee /etc/wireguard/wg0.conf >/dev/null <<EOF
+          [Interface]
+          Address = 10.66.66.1/24
+          ListenPort = ${WG_PORT}
+          PrivateKey = ${SRV_PRIV}
+          PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT
+          PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT
+          [Peer]
+          PublicKey = ${CLI_PUB}
+          AllowedIPs = 10.66.66.2/32
+          EOF
+          sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+          sudo wg-quick up wg0
+          sudo wg show
+
+          PUB_IP="$(curl -4 -s --max-time 8 https://api.ipify.org)"
+          echo "PUB_IP=$PUB_IP" >> "$GITHUB_ENV"
+          cat > out/wg-client.conf <<EOF
+          [Interface]
+          PrivateKey = ${CLI_PRIV}
+          Address = 10.66.66.2/24
+          DNS = 1.1.1.1
+          [Peer]
+          PublicKey = ${SRV_PUB}
+          Endpoint = ${PUB_IP}:${WG_PORT}
+          AllowedIPs = 0.0.0.0/0, ::/0
+          PersistentKeepalive = 25
+          EOF
+
+      # ---------- 3) پنل 3x-ui سنایی ----------
+      - name: Install 3x-ui panel
+        run: |
+          sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)" < /dev/null 2>&1 | tail -5 || true
+          sleep 5
+          # تنظیم نام کاربری/رمز/پورت پنل به‌صورت غیرتعاملی
+          sudo /usr/local/x-ui/x-ui setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" || true
+          sudo systemctl restart x-ui || true
+          sleep 5
+          for i in $(seq 1 15); do
+            if curl -s -o /dev/null "http://127.0.0.1:${PANEL_PORT}/"; then echo "panel up"; break; fi
+            sleep 2
+          done
+
+      - name: Create VLESS+Reality inbound via panel API
+        run: |
+          # لاگین به پنل
+          curl -s -c /tmp/panel.jar -X POST "http://127.0.0.1:${PANEL_PORT}/login" \
+            -d "username=${PANEL_USER}&password=${PANEL_PASS}" | head -c 200; echo
+          # کلیدهای Reality با باینری xray داخل 3x-ui
+          XBIN="$(ls /usr/local/x-ui/bin/xray* 2>/dev/null | head -n1)"
+          KP="$("$XBIN" x25519)"
+          PRIV="$(echo "$KP" | awk '/[Pp]rivate/{print $NF}')"
+          PUB="$(echo "$KP" | awk '/[Pp]ublic/{print $NF}')"
+          SID="$(openssl rand -hex 8)"
+          echo "REALITY_PUB=$PUB" >> "$GITHUB_ENV"
+          echo "REALITY_SID=$SID" >> "$GITHUB_ENV"
+
+          SETTINGS='{"clients":[{"id":"'"$UUID"'","flow":"xtls-rprx-vision","email":"gh1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":"","subId":"'"$(openssl rand -hex 8)"'","reset":0}],"decryption":"none"}'
+          STREAM='{"network":"tcp","security":"reality","realitySettings":{"show":false,"dest":"'"${REALITY_SNI}"':443","xver":0,"serverNames":["'"${REALITY_SNI}"'"],"privateKey":"'"$PRIV"'","shortIds":["","'"$SID"'"]}}'
+          SNIFF='{"enabled":true,"destOverride":["http","tls"]}'
+
+          curl -s -b /tmp/panel.jar -X POST "http://127.0.0.1:${PANEL_PORT}/panel/api/inbounds/add" \
+            -H "Content-Type: application/json" \
+            -d '{"up":0,"down":0,"total":0,"remark":"gh-runner","enable":true,"expiry":0,"listen":"","port":'"${VLESS_PORT}"',"protocol":"vless","settings":"'"${SETTINGS//\"/\\\"}"'","streamSettings":"'"${STREAM//\"/\\\"}"'","sniffing":"'"${SNIFF//\"/\\\"}"'"}' > /tmp/add.json
+          head -c 300 /tmp/add.json; echo
+          grep -q '"success":true' /tmp/add.json || { echo "::error::inbound creation failed"; exit 1; }
+
+      - name: Build vless links
+        run: |
+          mk() {
+            printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
+              "$UUID" "$1" "$VLESS_PORT" "$REALITY_SNI" "$REALITY_PUB" "$REALITY_SID" "$2"
+          }
+          mk "$PUB_IP" "gh-3xui-public" > out/vless-link.txt
+          mk "$TS_IP" "gh-3xui-tailscale" >> out/vless-link.txt
+          {
+            echo "PANEL: http://${PUB_IP}:${PANEL_PORT}/  (یا http://${TS_IP}:${PANEL_PORT}/)"
+            echo "user: ${PANEL_USER}  pass: ${PANEL_PASS}"
+          } > out/panel-info.txt
+          cat out/vless-link.txt
+
+      - name: Write summary
+        run: |
+          {
+            echo "## ✅ سرور فعال شد (۳x-ui + WireGuard + Tailscale)"
+            echo ""
+            echo "### 🔗 کانفیگ‌های vless (آی‌پی عمومی + تیل‌اسکیل)"
+            echo '```'
+            cat out/vless-link.txt
+            echo '```'
+            echo "### 🖥 پنل سنایی 3x-ui"
+            echo '```'
+            cat out/panel-info.txt
+            echo '```'
+            echo "### 📡 WireGuard"
+            echo "کانفیگ کلاینت: آرتیفکت wg-client.conf — Endpoint: ${PUB_IP}:${WG_PORT}/udp"
+            echo ""
+            echo "> ⏳ عمر رانر ~۶ ساعت. بعد از پایان، دوباره اجرا کنید و لینک جدید را جایگزین کنید."
+            echo "> 🔒 پنل و رمزها فقط در Summary/Artifacts همین اجرای خصوصی‌اند؛ ریپو را Private نگه دارید."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-configs
+          path: out/
+
+      - name: Keep alive (~5h45m)
+        run: |
+          end=$((SECONDS + 20700))
+          while [ $SECONDS -lt $end ]; do
+            sleep 300
+          alive="alive"
+          [ "$(sudo systemctl is-active x-ui)" = "active" ] || alive="x-ui DOWN"
+          echo "❤️ $alive — $(date -u '+%H:%M UTC') — tailscale=$(tailscale ip -4 | head -n1) — wgpeers=$(sudo wg show wg0 peers | wc -l)"
+          done
