@@ -1,4 +1,13 @@
-name: T2HASH Foreign Server + SSH + Tailscale
+      - name: Debug T2HASH installer
+        run: |
+          git clone https://github.com/T2HASH/T2HASH-CORE.git
+          cd T2HASH-CORE/t2tunnel
+
+          echo "===== INPUT CODE ====="
+          grep -n -E 'Choose|type 1|read .*choice|/dev/tty|select' install.sh || true
+
+          echo "===== INSTALLER HEAD ====="
+          sed -n '1,220p' install.shname: T2HASH Foreign Server + SSH + Tailscale
 
 on:
   workflow_dispatch:
