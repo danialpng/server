@@ -1,4 +1,4 @@
-````yaml
+
 name: Deploy Xray VLESS Reality
 
 on:
@@ -476,4 +476,3 @@ jobs:
           path: vless-link.txt
           if-no-files-found: error
           retention-days: 7
-````
